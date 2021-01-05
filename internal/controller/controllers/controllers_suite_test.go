@@ -9,9 +9,10 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/openshift/assisted-service/internal/controller/api/v1alpha1"
 	"github.com/sirupsen/logrus"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 func init() {

@@ -18,13 +18,12 @@ package controllers
 
 import (
 	"context"
+	"encoding/base64"
 	"time"
-
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
+	"github.com/jinzhu/gorm"
 	"github.com/openshift/assisted-service/internal/bminventory"
 	"github.com/openshift/assisted-service/internal/common"
 	adiiov1alpha1 "github.com/openshift/assisted-service/internal/controller/api/v1alpha1"
@@ -32,11 +31,16 @@ import (
 	"github.com/openshift/assisted-service/restapi/operations/installer"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 // ClusterReconciler reconciles a Cluster object
@@ -47,6 +51,7 @@ type ClusterReconciler struct {
 	Installer bminventory.InstallerInternals
 }
 
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;update
 // +kubebuilder:rbac:groups=adi.io.my.domain,resources=clusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=adi.io.my.domain,resources=clusters/status,verbs=get;update;patch
 
@@ -58,15 +63,32 @@ func (r *ClusterReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		if k8serrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
-		return ctrl.Result{}, errors.Wrap(err, "failed to get cluster data")
+		r.Log.WithError(err).Errorf("Failed to get resource %s", req.NamespacedName)
+		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// check if new cluster
-	if cluster.Status.ID == "" {
+	c, err := r.Installer.GetClusterByKubeKey(req.NamespacedName)
+
+	if gorm.IsRecordNotFoundError(err) {
 		return r.createNewCluster(ctx, req.NamespacedName, cluster)
 	}
 
-	return ctrl.Result{}, nil
+	// todo check error type, retry for 5xx fail on 4xx
+	if err != nil {
+		return r.updateState(ctx, cluster, nil, err)
+	}
+
+	// check for updates from user, compare spec and update if needed
+	updated, result, err := r.updateIfNeeded(ctx, cluster, c)
+	if err != nil {
+		return r.updateState(ctx, cluster, c, err)
+	}
+
+	if updated {
+		return result, err
+	}
+
+	return r.updateState(ctx, cluster, c, nil)
 }
 
 func (r *ClusterReconciler) getPullSecret(ctx context.Context, name, namespace string) (string, error) {
@@ -76,12 +98,18 @@ func (r *ClusterReconciler) getPullSecret(ctx context.Context, name, namespace s
 		Name:      name,
 	}
 	if err := r.Get(ctx, key, secret); err != nil {
-		return "", errors.Wrap(err, "to get pull secret")
+		return "", errors.Wrapf(err, "failed to get pull secret %s", key)
 	}
 
 	data, ok := secret.Data["pullSecret"]
 	if !ok {
 		return "", errors.Errorf("pullSecret is not configured")
+	}
+
+	out, err := base64.StdEncoding.DecodeString(string(data))
+	// if failed to decode return raw data
+	if err == nil {
+		return string(out), nil
 	}
 
 	return string(data), nil
@@ -92,11 +120,13 @@ func (r *ClusterReconciler) createNewCluster(
 	key types.NamespacedName,
 	cluster *adiiov1alpha1.Cluster) (ctrl.Result, error) {
 
+	r.Log.Infof("Creating a new cluster %s %s", cluster.Name, cluster.Namespace)
 	spec := cluster.Spec
 
 	pullSecret, err := r.getPullSecret(ctx, spec.PullSecretRef.Name, spec.PullSecretRef.Namespace)
 	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "failed to get pull secret")
+		r.Log.WithError(err).Error("failed to get pull secret")
+		return ctrl.Result{}, nil
 	}
 
 	c, err := r.Installer.RegisterClusterInternal(ctx, &key, installer.RegisterClusterParams{
@@ -120,18 +150,10 @@ func (r *ClusterReconciler) createNewCluster(
 		},
 	})
 	// TODO: handle specific errors, 5XX retry, 4XX update status with the error
-	if err != nil {
-		cluster.Status.Error = err.Error()
-		if err = r.Update(ctx, cluster); err != nil {
-			r.Log.WithError(err).Error("failed to update error status")
-		}
-		return ctrl.Result{}, errors.Wrap(err, "failed to create cluster")
-	}
-
-	return r.updateStatus(ctx, cluster, c)
+	return r.updateState(ctx, cluster, c, err)
 }
 
-func (r *ClusterReconciler) updateStatus(ctx context.Context, cluster *adiiov1alpha1.Cluster, c *common.Cluster) (ctrl.Result, error) {
+func (r *ClusterReconciler) syncClusterState(cluster *adiiov1alpha1.Cluster, c *common.Cluster) {
 	SetTimeIfNotNill := func(dst **metav1.Time, src strfmt.DateTime) {
 		var defaultTime strfmt.DateTime
 		if src != defaultTime {
@@ -171,17 +193,128 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, cluster *adiiov1al
 	SetTimeIfNotNill(&cluster.Status.LastUpdateTime, c.UpdatedAt)
 	SetTimeIfNotNill(&cluster.Status.ControllerLogsCollectionTime, c.ControllerLogsCollectedAt)
 	cluster.Status.ID = c.ID.String()
+	cluster.Status.Error = ""
+}
+
+func (r *ClusterReconciler) updateState(ctx context.Context, cluster *adiiov1alpha1.Cluster, c *common.Cluster,
+	err error) (ctrl.Result, error) {
+
+	if c != nil {
+		r.syncClusterState(cluster, c)
+	}
+
+	if err != nil {
+		cluster.Status.Error = err.Error()
+	}
 
 	if err := r.Status().Update(ctx, cluster); err != nil {
-		r.Log.WithError(err).Error("failed to update error status")
-		return ctrl.Result{}, errors.Wrap(err, "failed to create cluster")
+		r.Log.WithError(err).Errorf("failed set state for %s %s", cluster.Name, cluster.Namespace)
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	return ctrl.Result{}, nil
 }
 
+func (r *ClusterReconciler) updateIfNeeded(ctx context.Context, cluster *adiiov1alpha1.Cluster, c *common.Cluster) (bool, ctrl.Result, error) {
+	update := false
+
+	params := &models.ClusterUpdateParams{}
+
+	spec := cluster.Spec
+
+	updateString := func(new, old string, target **string) {
+		if new != old {
+			*target = swag.String(new)
+			update = true
+		}
+	}
+
+	updateString(spec.Name, c.Name, &params.Name)
+
+	if spec.OpenshiftVersion != c.OpenshiftVersion {
+		return false, ctrl.Result{}, errors.Errorf("Openshift version cannot be updated")
+	}
+
+	updateString(spec.BaseDNSDomain, c.BaseDNSDomain, &params.BaseDNSDomain)
+	updateString(spec.ClusterNetworkCidr, c.ClusterNetworkCidr, &params.ClusterNetworkCidr)
+
+	if spec.ClusterNetworkHostPrefix != c.ClusterNetworkHostPrefix {
+		params.ClusterNetworkHostPrefix = swag.Int64(spec.ClusterNetworkHostPrefix)
+		update = true
+	}
+
+	updateString(spec.ServiceNetworkCidr, c.ServiceNetworkCidr, &params.ServiceNetworkCidr)
+	updateString(spec.APIVip, c.APIVip, &params.APIVip)
+	updateString(spec.APIVipDNSName, swag.StringValue(c.APIVipDNSName), &params.APIVipDNSName)
+	updateString(spec.IngressVip, c.IngressVip, &params.IngressVip)
+	updateString(spec.MachineNetworkCidr, c.MachineNetworkCidr, &params.MachineNetworkCidr)
+	updateString(spec.SSHPublicKey, c.SSHPublicKey, &params.SSHPublicKey)
+
+	if spec.VIPDhcpAllocation != swag.BoolValue(c.VipDhcpAllocation) {
+		params.VipDhcpAllocation = swag.Bool(spec.VIPDhcpAllocation)
+	}
+
+	updateString(spec.HTTPProxy, c.HTTPProxy, &params.HTTPProxy)
+	updateString(spec.HTTPSProxy, c.HTTPSProxy, &params.HTTPSProxy)
+	updateString(spec.NoProxy, c.NoProxy, &params.NoProxy)
+
+	if spec.UserManagedNetworking != swag.BoolValue(c.UserManagedNetworking) {
+		params.UserManagedNetworking = swag.Bool(spec.UserManagedNetworking)
+	}
+
+	updateString(spec.AdditionalNtpSource, c.AdditionalNtpSource, &params.AdditionalNtpSource)
+
+	// TODO: handle InstallConfigOverrides
+
+	data, err := r.getPullSecret(ctx, spec.PullSecretRef.Name, spec.PullSecretRef.Namespace)
+	if err != nil {
+		return false, ctrl.Result{}, errors.Wrap(err, "failed to get pull secret for update")
+	}
+	updateString(data, c.PullSecret, &params.PullSecret)
+
+	if !update {
+		return update, ctrl.Result{}, nil
+	}
+
+	updatedCluster, err := r.Installer.UpdateClusterInternal(ctx, installer.UpdateClusterParams{
+		ClusterUpdateParams: params,
+		ClusterID:           *c.ID,
+	})
+
+	// TODO: check error type, retry for 5xx
+	if err != nil {
+		return update, ctrl.Result{}, errors.Wrap(err, "failed to update cluster")
+	}
+
+	r.Log.Infof("Updated cluster %s %s", cluster.Name, cluster.Namespace)
+	reply, err := r.updateState(ctx, cluster, updatedCluster, nil)
+	return update, reply, err
+
+}
+
 func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	mapSecretToCluster := handler.ToRequestsFunc(
+		func(a handler.MapObject) []reconcile.Request {
+			clusters := &adiiov1alpha1.ClusterList{}
+			if err := r.List(context.Background(), clusters); err != nil {
+				return []reconcile.Request{}
+			}
+			reply := make([]reconcile.Request, 0, len(clusters.Items))
+			for _, cluster := range clusters.Items {
+				if cluster.Spec.PullSecretRef.Name == a.Meta.GetName() &&
+					cluster.Spec.PullSecretRef.Namespace == a.Meta.GetNamespace() {
+					reply = append(reply, reconcile.Request{NamespacedName: types.NamespacedName{
+						Namespace: cluster.Namespace,
+						Name:      cluster.Name,
+					}})
+				}
+			}
+			return reply
+		})
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&adiiov1alpha1.Cluster{}).
+		Watches(&source.Kind{Type: &corev1.Secret{}},
+			&handler.EnqueueRequestsFromMapFunc{ToRequests: mapSecretToCluster}).
 		Complete(r)
 }
