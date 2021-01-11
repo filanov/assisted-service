@@ -10,6 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"sigs.k8s.io/controller-runtime/pkg/event"
+
+	"github.com/openshift/assisted-service/internal/controller/eventwrapper"
+
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
 	"github.com/jinzhu/gorm"
@@ -178,7 +182,8 @@ func main() {
 	versionHandler := versions.NewHandler(log.WithField("pkg", "versions"), releaseHandler,
 		Options.Versions, openshiftVersionsMap, Options.ReleaseImageOverride, Options.ReleaseImageMirror)
 	domainHandler := domains.NewHandler(Options.BMConfig.BaseDNSDomains)
-	eventsHandler := events.New(db, log.WithField("pkg", "events"))
+	notificationsChan := make(chan event.GenericEvent)
+	eventsHandler := getEventsHandler(db, log, notificationsChan)
 	hwValidator := hardware.NewValidator(log.WithField("pkg", "validators"), Options.HWValidatorConfig)
 	connectivityValidator := connectivity.NewValidator(log.WithField("pkg", "validators"))
 	instructionApi := host.NewInstructionManager(log.WithField("pkg", "instructions"), db, hwValidator,
@@ -399,10 +404,11 @@ func main() {
 			}).SetupWithManager(ctrlMgr), "unable to create controller Image")
 
 			failOnError((&controllers.ClusterReconciler{
-				Client:    ctrlMgr.GetClient(),
-				Log:       log,
-				Scheme:    ctrlMgr.GetScheme(),
-				Installer: bm,
+				Client:            ctrlMgr.GetClient(),
+				Log:               log,
+				Scheme:            ctrlMgr.GetScheme(),
+				Installer:         bm,
+				NotificationsChan: notificationsChan,
 			}).SetupWithManager(ctrlMgr), "unable to create controller Cluster")
 
 			failOnError((&controllers.HostReconciler{
@@ -416,6 +422,21 @@ func main() {
 	}()
 
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", swag.StringValue(port)), h))
+}
+
+func getEventsHandler(db *gorm.DB, log logrus.FieldLogger, notificationsChan chan event.GenericEvent) events.Handler {
+	ev := events.New(db, log.WithField("pkg", "events"))
+	if !Options.EnableKubeAPI {
+		return ev
+	}
+
+	return &eventwrapper.Wrapper{
+		NotificationsChan: notificationsChan,
+		Inner:             ev,
+		DB:                db,
+		Log:               log.WithField("pkg", "eventsWrapper"),
+	}
+
 }
 
 func setupDB(log logrus.FieldLogger) *gorm.DB {
@@ -511,7 +532,7 @@ func createControllerManager() (manager.Manager, error) {
 		utilruntime.Must(scheme.AddToScheme(schemes))
 		utilruntime.Must(adiiov1alpha1.AddToScheme(schemes))
 
-		syncPeriod := 10 * time.Second
+		//syncPeriod := 10 * time.Second
 
 		return ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 			Scheme:           schemes,
@@ -519,7 +540,7 @@ func createControllerManager() (manager.Manager, error) {
 			LeaderElection:   true,
 			LeaderElectionID: "77190dcb.my.domain",
 			// TODO: remove it after we have backend notifications
-			SyncPeriod: &syncPeriod,
+			//SyncPeriod: &syncPeriod,
 		})
 	}
 	return nil, nil
