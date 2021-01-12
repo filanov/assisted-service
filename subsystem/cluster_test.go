@@ -2740,6 +2740,52 @@ var _ = Describe("cluster install, with default network params", func() {
 	})
 })
 
+var _ = Describe("existing_cluster", func() {
+	ctx := context.Background()
+	clusterID := strfmt.UUID("595abb03-c660-4680-a853-77f12cf85da1")
+
+	generateFAPostStepReply := func(h *models.Host, freeAddresses models.FreeNetworksAddresses) {
+		fa, err := json.Marshal(&freeAddresses)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = agentBMClient.Installer.PostStepReply(ctx, &installer.PostStepReplyParams{
+			ClusterID: h.ClusterID,
+			HostID:    *h.ID,
+			Reply: &models.StepReply{
+				ExitCode: 0,
+				Output:   string(fa),
+				StepID:   string(models.StepTypeFreeNetworkAddresses),
+				StepType: models.StepTypeFreeNetworkAddresses,
+			},
+		})
+		Expect(err).ShouldNot(HaveOccurred())
+	}
+
+	It("add_hosts_to_existing_cluster", func() {
+		hosts := make([]*models.Host, 0)
+		for i := 0; i < 5; i++ {
+			hostname := fmt.Sprintf("h%d", i)
+			host := &registerHost(clusterID).Host
+			generateHWPostStepReply(ctx, host, validHwInfo, hostname)
+			generateFAPostStepReply(host, validFreeAddresses)
+			generateNTPPostStepReply(ctx, host, validNtpSources)
+			hosts = append(hosts, host)
+		}
+		generateFullMeshConnectivity(ctx, "1.2.3.10", hosts...)
+	})
+
+	It("hosts_keep_alive_existing_cluster", func() {
+		cluster := getCluster(clusterID)
+		for i := range cluster.Hosts {
+			registerHostByUUID(clusterID, *cluster.Hosts[i].ID)
+			hostname := fmt.Sprintf("h%d", i)
+			generateHWPostStepReply(ctx, cluster.Hosts[i], validHwInfo, hostname)
+			generateFAPostStepReply(cluster.Hosts[i], validFreeAddresses)
+			generateNTPPostStepReply(ctx, cluster.Hosts[i], validNtpSources)
+		}
+		generateFullMeshConnectivity(ctx, "1.2.3.10", cluster.Hosts...)
+	})
+})
+
 func registerHostsAndSetRoles(clusterID strfmt.UUID, numHosts int) []*models.Host {
 	ctx := context.Background()
 	hosts := make([]*models.Host, 0)
