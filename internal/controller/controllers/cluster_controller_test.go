@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"time"
 
 	"github.com/jinzhu/gorm"
 
@@ -145,7 +146,8 @@ var _ = Describe("cluster reconcile", func() {
 			request := newClusterRequest(cluster)
 			result, err := cr.Reconcile(request)
 			Expect(err).To(BeNil())
-			Expect(result).To(Equal(ctrl.Result{}))
+			//Expect(result).To(Equal(ctrl.Result{}))
+			Expect(result).To(Equal(ctrl.Result{RequeueAfter: 10 * time.Second}))
 
 			cluster = getTestCluster()
 			Expect(cluster.Status.Error).To(Equal(expectedError.Error()))
@@ -236,7 +238,8 @@ var _ = Describe("cluster reconcile", func() {
 			request := newClusterRequest(cluster)
 			result, err := cr.Reconcile(request)
 			Expect(err).To(BeNil())
-			Expect(result).To(Equal(ctrl.Result{}))
+			//Expect(result).To(Equal(ctrl.Result{}))
+			Expect(result).To(Equal(ctrl.Result{RequeueAfter: 10 * time.Second}))
 			cluster = getTestCluster()
 			Expect(cluster.Status.Error).To(Equal(expectedError.Error()))
 		})
@@ -262,7 +265,8 @@ var _ = Describe("cluster reconcile", func() {
 			request := newClusterRequest(cluster)
 			result, err := cr.Reconcile(request)
 			Expect(err).To(BeNil())
-			Expect(result).To(Equal(ctrl.Result{}))
+			//Expect(result).To(Equal(ctrl.Result{}))
+			Expect(result).To(Equal(ctrl.Result{RequeueAfter: 10 * time.Second}))
 
 			cluster = getTestCluster()
 			Expect(cluster.Status.Error).NotTo(Equal(""))

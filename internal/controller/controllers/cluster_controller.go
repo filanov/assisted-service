@@ -200,6 +200,7 @@ func (r *ClusterReconciler) syncClusterState(cluster *adiiov1alpha1.Cluster, c *
 
 func (r *ClusterReconciler) updateState(ctx context.Context, cluster *adiiov1alpha1.Cluster, c *common.Cluster,
 	err error) (ctrl.Result, error) {
+	reply := ctrl.Result{}
 
 	if c != nil {
 		r.syncClusterState(cluster, c)
@@ -207,6 +208,7 @@ func (r *ClusterReconciler) updateState(ctx context.Context, cluster *adiiov1alp
 
 	if err != nil {
 		cluster.Status.Error = err.Error()
+		reply.RequeueAfter = 10 * time.Second
 	}
 
 	if err := r.Status().Update(ctx, cluster); err != nil {
@@ -214,7 +216,7 @@ func (r *ClusterReconciler) updateState(ctx context.Context, cluster *adiiov1alp
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	return ctrl.Result{}, nil
+	return reply, nil
 }
 
 func (r *ClusterReconciler) updateIfNeeded(ctx context.Context, cluster *adiiov1alpha1.Cluster, c *common.Cluster) (bool, ctrl.Result, error) {
@@ -249,7 +251,9 @@ func (r *ClusterReconciler) updateIfNeeded(ctx context.Context, cluster *adiiov1
 	updateString(spec.APIVip, c.APIVip, &params.APIVip)
 	updateString(spec.APIVipDNSName, swag.StringValue(c.APIVipDNSName), &params.APIVipDNSName)
 	updateString(spec.IngressVip, c.IngressVip, &params.IngressVip)
-	updateString(spec.MachineNetworkCidr, c.MachineNetworkCidr, &params.MachineNetworkCidr)
+	if spec.MachineNetworkCidr != nil {
+		updateString(*spec.MachineNetworkCidr, c.MachineNetworkCidr, &params.MachineNetworkCidr)
+	}
 	updateString(spec.SSHPublicKey, c.SSHPublicKey, &params.SSHPublicKey)
 
 	if spec.VIPDhcpAllocation != swag.BoolValue(c.VipDhcpAllocation) {
